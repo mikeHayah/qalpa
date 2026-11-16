@@ -67,10 +67,12 @@ EQdiffParam:
   batch_size: 20
   batch_size_tr: 64
   num_epochs: 50
-  test_interval: 25                    # sampling eval (1000 mols) every k epochs; best_mol_stab.ckpt is only saved here
-  context_mapping: True
-  properties_list: ['HLgap', 'eMBD']            # Properties to track should be edited
+  test_interval: 5                    # sampling eval (1000 mols) every k epochs; best_mol_stab.ckpt is only saved here
+  context_mapping: True                 # condition the model on properties_list (False = unconditional model)
+  properties_list: ['HLgap', 'eMBD']    # context properties; must equal query.props without atNUM, same order. atNUM is a size target, not a context feature
   num_context_features: ${len:${EQdiffParam.properties_list}}
+  n_nodes: null                         # atoms per molecule, read ONLY when query.props is empty: int, per-iteration list, or null = sampled.
+                                        # With query.props set, size comes from the trajectory's atNUM column (sampled if atNUM is not in query.props)
   dataset_root: ${paths.data}/${experiment_name}/diffusion_wdir/data/
   model_root: ${paths.data}/${experiment_name}/diffusion_wdir/model_registry/
   test_save_dir: ${paths.data}/${experiment_name}/diffusion_wdir/test/   # per iteration: test/model_iter_<n>
@@ -119,7 +121,8 @@ geometry:
 
 query:
   trajectory_csv: ${paths.experiments}/${experiment_name}/configs/trajectory_*.csv
-  props: ${EQdiffParam.properties_list}              # Properties to track
+  props: ['HLgap', 'eMBD', 'atNUM']     # trajectory CSV columns read as per-iteration targets; only these are loaded.
+                                        # = EQdiffParam.properties_list (+ atNUM for molecule size). Remove atNUM if the CSV has no atNUM column
   scores: ["SAScore"]                   # Scores to track
   filter_scheme: [score, accuracy]      # Filtering scheme to apply
   filter_threshold: 0.1                 # Filteration threshold for accuracy
