@@ -15,6 +15,9 @@ from src.pipeline_blocks.calculate_sascore import sascore
 from src.pipeline_blocks.propcalc_postprocess import prop_postprocess
 from src.pipeline_blocks.propcalc_preprocess import preprocess_fhi
 from src.pipeline_blocks.to_hdf5 import run_to_hdf5
+from src.pipeline_blocks.score_screen import (REFERENCE_INITIAL, initial_reference, score_reference_mode,
+                                              screen_query, trajectory_score_names)
+from src.utils.al_config import al_paths, get_al_cfg, resolve_blocks, resolve_start, resolve_tolerances, validate_al_cfg
 
 # Allow experiment_config.yaml to derive values such as num_context_features from list lengths
 OmegaConf.register_new_resolver("len", len, replace=True)
@@ -31,16 +34,21 @@ def main(cfg: DictConfig):
     It sets up the environment, runs pipeline units in a loop.
     '''
     # Create exterapolating trajectory for properties and scores (experiment_config.yaml -> query.*)
-    my_trajectory = Trajectory(cfg.query.trajectory_csv, prop_names=list(cfg.query.props), score_names=list(cfg.query.scores))
+    my_trajectory = Trajectory(cfg.query.trajectory_csv, prop_names=list(cfg.query.props), score_names=trajectory_score_names(cfg))
     context_flag = my_trajectory.has_properties
+
+    # Optional active-learning target planning (experiment_config.yaml -> al.*, defaults in src/configs/al.yaml)
+    al = get_al_cfg(cfg)
+    al_on = bool(al["enabled"])
+    validate_al_cfg(cfg, al, my_trajectory)
 
     # Create Molecular Filter
     molecular_filter = MolecularFilter(my_trajectory)
     filteration_scheme = cfg.query.filter_scheme
               
     # Flag to resume in the midde of the loop
-    pipeline_blocks = list(cfg.pipeline.blocks)
-    start_at = cfg.pipeline.start_at
+    pipeline_blocks = resolve_blocks(cfg, al)
+    start_at = resolve_start(cfg, al, pipeline_blocks)
     if start_at in pipeline_blocks:
         active_blocks = set(pipeline_blocks[pipeline_blocks.index(start_at):])
     else:
@@ -48,6 +56,9 @@ def main(cfg: DictConfig):
     
     # Create directories 
     dm = DataManager(cfg.base_dataset_path, cfg.data.exp_data_path)
+    dm.hdf5_appending_flag = bool(cfg.hdf5.appending_flag)
+    dm.hdf5_iter_flag = bool(cfg.hdf5.hdf5_iter_flag)
+    dm.extra_properties_flag = bool(cfg.hdf5.extra_properties_flag)
     dm.initialize_data_directory()
     n = cfg.loop.current_iter
     if n > cfg.loop.num_iterations:
@@ -57,9 +68,24 @@ def main(cfg: DictConfig):
     dm.create_iteration_directories(n)
 
     prop_calc_path = dm.current_data / "prop_calc"
+    # With planned targets the trajectory may be shorter than the number of iterations
+    score_idx = min(n, len(my_trajectory) - 1) if al_on else n
     
+    # (dedup runs at the end of the forward step, so query/ already holds only the deduplicated molecules)
+
     # Step 4: Calculate Score and Filter molecules 
-    if 'score_filter' in active_blocks:
+    if 'score_filter' in active_blocks and score_reference_mode(cfg) == REFERENCE_INITIAL:
+        if 'score' in filteration_scheme:
+            # QED > mean QED x (1 - r_QED) and SA < mean SA x (1 + r_SA) of the initial dataset (both; query.score_relax)
+            print("  Running Filter molecules based on QED and SA score (initial-dataset means)  ")
+            reference = initial_reference(dm.input_hdf5)
+            relax = cfg.query.get("score_relax")
+            relax = OmegaConf.to_container(relax, resolve=True) if relax is not None else None
+            screen_query(dm.query_data, dm.current_data / "score_filtered", reference, relax=relax,
+                         scores=list(cfg.query.get("scores", ["SAScore", "QED"])))
+        else:
+            print("  score_filter skipped: 'score' is not in query.filter_scheme")
+    elif 'score_filter' in active_blocks:
         if 'score' in filteration_scheme and my_trajectory.has_scores:
             print("  Running Filter molecules based on Score  ")
             score_filtered_path = dm.current_data / "score_filtered"
@@ -71,7 +97,15 @@ def main(cfg: DictConfig):
                 # Filter molecules based on SAScore
                 fscored_path = score_filtered_path / score_name
                 fscored_path.mkdir(parents=True, exist_ok=True)
-                molecular_filter.score_filter(dm.query_data, fscored_path, score_name, score_filtered_path / f'{score_name.lower()}.txt', n)
+                molecular_filter.score_filter(dm.query_data, fscored_path, score_name, score_filtered_path / f'{score_name.lower()}.txt', score_idx)
+                # same summary file as the initial_mean screen, so the counts survive the cleanup below
+                n_in = sum(1 for f in dm.query_data.iterdir() if f.is_file() and f.suffix == '.xyz')
+                n_pass = sum(1 for f in fscored_path.iterdir() if f.is_file() and f.suffix == '.xyz')
+                import json
+                (score_filtered_path / "score_screen_summary.json").write_text(json.dumps({
+                    "reference": "trajectory", "score": score_name,
+                    "threshold": float(my_trajectory.scores[score_name][score_idx]),
+                    "counts": {"total": n_in, "passed": n_pass, "rejected": n_in - n_pass}}, indent=2))
                 # clean query directory
                 dm.clean_dir(dm.query_data)
                 # copy filtered molecules to the query data path
@@ -120,7 +154,18 @@ def main(cfg: DictConfig):
             
         
     # Step 7: Filter molecules based on properties
-    if 'prop_filter' in active_blocks and context_flag:
+    if 'prop_filter' in active_blocks and context_flag and al_on:
+        if 'accuracy' in filteration_scheme:
+            # active learning: each molecule against the target it was generated for (anchor or additional)
+            print("  Running Filter molecules based on properties (per planned target)  ")
+            from src.pipeline_blocks.label_targets import filter_by_own_target
+            filter_props = list(my_trajectory.plan_names)
+            filter_by_own_target(query_dir=dm.query_data, prop_dir=prop_calc_path, iter_dir=dm.current_data,
+                                 prop_names=filter_props, iteration=n,
+                                 tolerances=resolve_tolerances(al, filter_props, float(cfg.query.filter_threshold)))
+        else:
+            print("  prop_filter skipped: 'accuracy' is not in query.filter_scheme")
+    elif 'prop_filter' in active_blocks and context_flag:
         if 'accuracy' in filteration_scheme and my_trajectory.has_properties:
             print("  Running Filter molecules based on properties  ")
             accuracy_filtered_path = dm.current_data / "accuracy_filtered"
@@ -145,7 +190,35 @@ def main(cfg: DictConfig):
     # Step 8: Create HDF5
     if 'hdf5' in active_blocks:
         print("  Running Create HDF5  ")
-        run_to_hdf5(dm.query_data, prop_calc_path, cfg.hdf5.appending_flag, dm.output_hdf5, context_flag, cfg.hdf5.extra_properties_flag, cfg.hdf5.hdf5_iter_flag, dm.itr_extra_prop_path, n)
+        al_meta, al_props = None, None
+        if al_on:
+            # hit/miss against each molecule's own planned target (after prop_filter, only hits remain)
+            from src.pipeline_blocks.label_targets import prepare_al_labels
+            al_props = list(my_trajectory.plan_names)
+            al_meta = prepare_al_labels(query_dir=dm.query_data, prop_dir=prop_calc_path, iter_dir=dm.current_data,
+                                        prop_names=al_props, iteration=n,
+                                        tolerances=resolve_tolerances(al, al_props, float(cfg.query.filter_threshold)),
+                                        keep_off_target=bool(al["keep_off_target"]))
+        run_to_hdf5(
+            dm.query_data,
+            prop_calc_path,
+            cfg.hdf5.appending_flag,
+            dm.output_hdf5,
+            context_flag,
+            dm.extra_prop_hdf5 if cfg.hdf5.extra_properties_flag else None,
+            dm.itr_hdf5_path if cfg.hdf5.hdf5_iter_flag else None,
+            dm.itr_extra_prop_path if cfg.hdf5.extra_properties_flag else None,
+            n,
+            al_meta=al_meta,
+            al_props=al_props,
+        )
+
+    # Step 9 (active learning): hit rate and corridor coverage
+    if al_on and 'evaluate' in active_blocks:
+        print("  Running Evaluate  ")
+        from src.pipeline_blocks.evaluate_targets import run_evaluate
+        run_evaluate(traj=my_trajectory, al=al, hdf5_path=dm.output_hdf5, iteration=n, seed=int(cfg.system.seed),
+                     metrics_file=al_paths(cfg)["metrics_file"], iter_dir=dm.current_data)
     
     print(f"\n Completed iteration {n} \n")
     # increment cfg.loop.current_iter and save the updated configuration to the experiment_config.yaml file

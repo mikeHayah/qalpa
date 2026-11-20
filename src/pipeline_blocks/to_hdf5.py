@@ -13,7 +13,8 @@ from ase.io import read
 import h5py
 from contextlib import ExitStack
 
-def run_to_hdf5(query_dir, prop_dir, appending_flag, h5file_output, context_flag, output_extra_prop, h5file_itr, itr_extra_prop, itr):
+def run_to_hdf5(query_dir, prop_dir, appending_flag, h5file_output, context_flag, output_extra_prop, h5file_itr, itr_extra_prop, itr,
+                al_meta=None, al_props=None):
     """
     Function to convert filtered molecules into HDF5 format.
     It reads filtered molecules from a directory, extracts properties,
@@ -28,12 +29,18 @@ def run_to_hdf5(query_dir, prop_dir, appending_flag, h5file_output, context_flag
         - h5file_itr: Path to the output HDF5 file for the current iteration.
         - itr_extra_prop: Path to the output HDF5 file for extra properties in iteration files.
         - itr: Current iteration number.
+        - al_meta: Optional active-learning labels keyed by canonical molecule ID (see label_targets.py);
+          written as al_iteration / al_target_id / al_requested / al_hit to the main and iteration files.
+        - al_props: Property names in the order of al_meta[...]['requested'] (stored as the al_props attribute).
     """
     ## initialize database
     EPBE0_atom = {1:-13.64136507, 6:-1027.59344601, \
                 7:-1484.25358313, 8:-2039.74560236, 9: -3139.751675679, 15:-9283.01120606, 16: -10828.726222083, 17: -12516.462339357}
 
     
+    if al_meta is not None:
+        from src.utils.candidates import canonical_id
+
     mode = 'a' if appending_flag else 'w'
 
     with ExitStack() as stack:
@@ -127,6 +134,16 @@ def run_to_hdf5(query_dir, prop_dir, appending_flag, h5file_output, context_flag
                             exx_raw = data["SUM"].get("Hartree-Fock Energy")
                             if exx_raw is not None:
                                 molecule['eXX'] = np.array([exx_raw], dtype=np.float64)
+
+                    # Active-learning provenance (target requested for this molecule and hit/miss)
+                    al_entry = al_meta.get(canonical_id(mol_name)) if (al_meta is not None and 'extra_prop' not in name) else None
+                    if al_entry is not None:
+                        molecule['al_iteration'] = np.array([al_entry['iteration']], dtype=np.int64)
+                        molecule['al_target_id'] = np.array([al_entry['target_id']], dtype=np.int64)
+                        molecule['al_requested'] = np.array(al_entry['requested'], dtype=np.float64)
+                        molecule['al_hit'] = np.array([al_entry['hit']], dtype=np.int8)
+                        if al_props:
+                            subgrp.attrs['al_props'] = ','.join(al_props)
 
                     # Writing properties
                     for key, value in molecule.items():
